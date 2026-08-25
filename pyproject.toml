@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdoclust-parallel"
+version = "0.1.0"
+description = "Parallel (joblib) and distributed (Dask) implementation of SDO / SDOclust"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "joblib",
+]
+
+[tool.setuptools.packages.find]
+include = ["sdoclust_parallel*"]
