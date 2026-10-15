@@ -1,16 +1,26 @@
-from typing import Callable, Optional, Union
-
 import numpy as np
-from sklearn.base import BaseEstimator, ClusterMixin
 from sklearn.neighbors import NearestNeighbors
-from sklearn.utils.validation import validate_data
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
+from sklearn.base import BaseEstimator, ClusterMixin
+from sklearn.utils.validation import validate_data
+
+
+def distances_to_adjacency_matrix(distances, indices, threshold):
+    N = distances.shape[0]
+
+    mask = distances[:, 1:] < threshold[:, None]
+
+    rows = np.repeat(np.arange(N), mask.sum(axis=1))
+    cols = indices[:, 1:][mask]
+
+    adjacency_matrix = csr_matrix((np.ones(len(rows), dtype=bool), (rows, cols)), shape=(N, N))
+    return adjacency_matrix.minimum(adjacency_matrix.T)
 
 
 class ConnectedComponentsClustering(ClusterMixin, BaseEstimator):
-    def __init__( self, zeta: float, chi: Optional[int], chi_min: int, chi_prop: float, metric: Union[str, Callable] = "euclidean", n_jobs: Optional[int] = None,
-    ) -> None:
+
+    def __init__(self, zeta, chi, chi_min, chi_prop, metric="euclidean", n_jobs=None):
         self.zeta = zeta
         self.chi = chi
         self.chi_min = chi_min
@@ -22,37 +32,28 @@ class ConnectedComponentsClustering(ClusterMixin, BaseEstimator):
     def fit(self, X: np.ndarray):
         X = validate_data(self, X, accept_sparse="csr")
 
-        # Memory and speed optimization
-        if X.dtype != np.float32:
-            X = X.astype(np.float32, copy=False)
+        # Optimizacion de memoria y velocidad
+        X = X.astype(np.float32, copy=False)
 
-        # calculates chi and searches chi+1 closest neighbours
-        n_samples = X.shape[0]
-        chi = self.chi or max(int(n_samples * self.chi_prop), self.chi_min) 
-        nn = NearestNeighbors( n_neighbors=chi + 1, metric=self.metric, n_jobs=self.n_jobs, ) 
+        m = X.shape[0]
+        chi = self.chi or max(int(m * self.chi_prop), self.chi_min)
+
+        # Se buscan los chi + 1 vecinos mas cercanos (el primero es el propio punto)
+        nn = NearestNeighbors(n_neighbors=chi + 1, metric=self.metric, n_jobs=self.n_jobs)
         distances, indices = nn.fit(X).kneighbors(X)
-        
-        # calculates threshold for cutting sub-graphs
-        aux = distances[:, chi]
-        mean_aux = aux.mean()
-        threshold = self.zeta * aux + (1.0 - self.zeta) * mean_aux
-        self.threshold_ = threshold
 
-        # building the adjacency matrix based on threshold
-        rows, cols = [], []
-        for i in range(n_samples):
-            mask = distances[i, 1:] < threshold[i]
-            neighs = indices[i, 1:][mask]
-            rows.extend([i] * len(neighs))
-            cols.extend(neighs)
-        adjacency = csr_matrix( (np.ones(len(rows), dtype=bool), (rows, cols)), shape=(n_samples, n_samples), )
-        adjacency = adjacency.minimum(adjacency.T) # makes it symmetrical
-        
-        # assigns labels to connected components
-        _, labels = connected_components(csgraph=adjacency, directed=False, return_labels=True )
+        # Umbral de corte por punto
+        aux = distances[:, chi]
+        mean_aux = np.mean(aux)
+        self.threshold_ = self.zeta * aux + (1 - self.zeta) * mean_aux
+
+        adjacency_matrix = distances_to_adjacency_matrix(distances, indices, self.threshold_)
+
+        labels = connected_components(csgraph=adjacency_matrix, directed=False, return_labels=True)[1]
         self.labels_ = labels
+
         return self
 
     def fit_predict(self, X: np.ndarray):
-        return self.fit(X).labels_
-
+        self.fit(X)
+        return self.labels_
