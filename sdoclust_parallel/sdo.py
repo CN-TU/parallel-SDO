@@ -55,7 +55,7 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
     Xs = X[idx]
 
     Xs = StandardScaler().fit_transform(Xs)
-    Xp = PCA(n_components=2, random_state=random_state).fit_transform(Xs)
+    Xp = PCA(n_components=1, random_state=random_state).fit_transform(Xs)
 
     return np.sqrt(np.var(Xp) / d)
     
