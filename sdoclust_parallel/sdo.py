@@ -47,7 +47,7 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
     -------
     float   - Estimated standard deviation (min 1.0).
     """
-    m = X.shape[0]
+    m, d = X.shape
     n_sample = min(m, max_samples)
 
     rng = np.random.default_rng(random_state)
@@ -57,8 +57,8 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
     Xs = StandardScaler().fit_transform(Xs)
     Xp = PCA(n_components=2, random_state=random_state).fit_transform(Xs)
 
-    return max(np.std(Xp), 1.0)
-
+    return np.sqrt(np.var(Xp) / d)
+    
 def random_sample(X, n, random_state=0):
     """
     Sample n rows from X, supporting numpy or dask arrays/dataframes.
@@ -346,7 +346,7 @@ class SDO_numpy:
         m = X.shape[0]
         if self.k is None:
             sigma = estimate_sigma_pca( X,  max_samples=self.max_samples_pca,  random_state=self.rseed )
-            error = 0.1 * sigma
+            error = 0.02
             self.k = sample_size(m, sigma, error)
         k = self.k
 
