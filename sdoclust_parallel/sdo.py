@@ -346,7 +346,7 @@ class SDO_numpy:
         m = X.shape[0]
         if self.k is None:
             sigma = estimate_sigma_pca( X,  max_samples=self.max_samples_pca,  random_state=self.rseed )
-            error = 0.02
+            error = 0.1
             self.k = sample_size(m, sigma, error)
         k = self.k
 
