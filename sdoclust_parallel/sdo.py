@@ -6,6 +6,7 @@ from .clust import ConnectedComponentsClustering
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from joblib import Parallel, delayed
+from scipy.optimize import linear_sum_assignment
 
 def materialize(X):
     """Convert dask arrays to numpy arrays"""
@@ -45,7 +46,7 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
 
     Returns
     -------
-    float   - Estimated standard deviation (min 1.0).
+    float   - sigma = sqrt(var(PC1) / d) on standardized data (sigma**2 in (0, 1]).
     """
     m, d = X.shape
     n_sample = min(m, max_samples)
@@ -59,6 +60,17 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
 
     return np.sqrt(np.var(Xp) / d)
     
+def model_error(m):
+    """Admissible error of the sample-size formula (your formula, unchanged)."""
+    return 0.1 / (1 + np.sqrt(np.log10(m)))
+
+def estimate_k(X, max_samples=100000, random_state=0):
+    """Returns (k, sigma2). k is Cochran's sample size with sigma^2 = var(PC1)/d."""
+    m = X.shape[0]
+    sigma = estimate_sigma_pca(X, max_samples=max_samples, random_state=random_state)
+    k = sample_size(m, sigma, model_error(m))
+    return max(1, min(k, m)), float(sigma ** 2)
+
 def random_sample(X, n, random_state=0):
     """
     Sample n rows from X, supporting numpy or dask arrays/dataframes.
@@ -75,103 +87,101 @@ def random_sample(X, n, random_state=0):
     """
     if isinstance(X, np.ndarray):
         m = X.shape[0]
-        rng = np.random.RandomState(random_state)
+        rng = np.random.default_rng(random_state)
         idx = rng.choice(m, size=min(n, m), replace=False)
         return X[idx]
     import dask.array as da
     import dask.dataframe as dd
-    if isinstance(X, (da.Array, dd.DataFrame)):
-        if isinstance(X, da.Array):
-            X = X.to_dask_dataframe()
+    if isinstance(X, da.Array):
+        m = X.shape[0]
+        if np.isnan(m):
+            X = X.compute_chunk_sizes()
+            m = X.shape[0]
+        idx = np.sort(np.random.default_rng(random_state).choice(m, size=min(n, m), replace=False))
+        return np.asarray(X[idx].compute())
+    if isinstance(X, dd.DataFrame):
         m = len(X)
-        n_sample = min(n, m)
-        frac = n_sample / m
-        sampled_df = X.sample(frac=frac, random_state=random_state)
-        return sampled_df.compute().to_numpy()
-    else:
-        raise TypeError("X must be NumPy array, Dask array, or Dask DataFrame")
+        frac = min(n, m) / m
+        return X.sample(frac=frac, random_state=random_state).compute().to_numpy()
+    raise TypeError("X must be NumPy array, Dask array, or Dask DataFrame")
 
 
-def safe_knn(X, O, k, batch_size=50000):
-    """
-    Compute k-nearest neighbors of X with respect to O in batches.
+def default_chunksize(m, k, max_pairs=20000000):
+    return max(1, min(m, max_pairs // max(k, 1)))
 
-    Parameters
-    ----------
-    X : ndarray, shape (n_samples_X, n_features)    - Data points to query.
-    O : ndarray, shape (n_observers, n_features)    - Observer model.
-    k : int                                         - Number of neighbors to retrieve.
-    batch_size : int, optional                      - Rows per batch for memory efficiency.
-
-    Returns
-    -------
-    dist : ndarray, shape (n_samples_X, k)          - Distances to k-nearest neighbors.
-    idx : ndarray, shape (n_samples_X, k)           - Indices of k-nearest neighbors in O.
-    """
+def _knn_batches(X, O, knn, max_pairs=20000000):
     X = np.atleast_2d(X)
-    n = X.shape[0]
-    k = min(k, O.shape[0])
+    knn = min(knn, O.shape[0])
+    bs = default_chunksize(X.shape[0], O.shape[0], max_pairs)
+    for i in range(0, X.shape[0], bs):
+        D = distance.cdist(X[i:i+bs], O)
+        idx = np.argpartition(D, knn - 1, axis=1)[:, :knn]
+        yield i, np.take_along_axis(D, idx, axis=1), idx
 
-    all_dist = []
-    all_idx = []
+def _neighbor_batches(X, O, knn, method="brute", index=None):
+    X = np.atleast_2d(X)
+    if method == "brute":
+        for i, _, idx in _knn_batches(X, O, knn):
+            yield i, idx
+    elif method == "faiss":
+        _, idx = index.search(X.astype(np.float32), knn)
+        yield 0, idx
+    else:
+        idx, _ = index.query(X, k=knn)
+        yield 0, idx
 
-    for i in range(0, n, batch_size):
-        Xi = X[i:i+batch_size]
-        D = distance.cdist(Xi, O)
+def harmonize_labels(old_l, new_l):
+    mask = old_l >= 0
+    K = new_l.max() + 1
+    mapping = np.full(K, -1, dtype=int)
 
-        idx = np.argpartition(D, k-1, axis=1)[:, :k]
-        dist = np.take_along_axis(D, idx, axis=1)
+    if mask.any():
+        old_ids = np.unique(old_l[mask])
+        C = np.zeros((K, len(old_ids)), dtype=np.int64)
+        np.add.at( C, (new_l[mask], np.searchsorted(old_ids, old_l[mask])), 1 )
+        rows, cols = linear_sum_assignment(C, maximize=True)
+        valid = C[rows, cols] > 0
+        mapping[rows[valid]] = old_ids[cols[valid]]
+        available = np.setdiff1d( old_ids, mapping[mapping >= 0] )
+    else:
+        available = np.array([], dtype=int)
 
-        all_idx.append(idx)
-        all_dist.append(dist)
+    unmatched = np.flatnonzero(mapping == -1)
+    n_reuse = min(len(unmatched), len(available))
+    mapping[unmatched[:n_reuse]] = available[:n_reuse]
+    remaining = unmatched[n_reuse:]
+    next_label = old_l.max() + 1 if old_l.size else 0
+    mapping[remaining] = np.arange( next_label, next_label + len(remaining) )
 
-    return np.vstack(all_dist), np.vstack(all_idx)
-
-
-def _extend_labels_block(X_block, O, ol, knn, n_clusters, method="brute", index=None, return_labels=False):
+    return mapping[new_l]    
+        
+def _extend_labels_block(X_block, O, ol, knn, method="brute", index=None, return_membership=False):
     """
     Extend cluster labels for a block of data using the nearest observers.
 
-    Parameters
-    ----------
-    X_block : ndarray, shape (n_samples_block, n_features)  - Block of data points.
-    O : ndarray, shape (n_observers, n_features)            - Observer model.
-    ol : ndarray, shape (n_observers,)                      - Labels of observers.
-    knn : int                                               - Number of nearest observers to consider.
-    n_clusters : int                                        - Total number of clusters.
-    method : str, optional                                  - "brute", "faiss", or "pynndescent".
-    index : object, optional                                - Precomputed index if applicable.
-    return_labels : bool, optional                          - Whether to return hard labels.
-
     Returns
     -------
-    C_norm : ndarray, shape (n_samples_block, n_clusters)   - Normalized cluster counts.
-    labels : ndarray, shape (n_samples_block,), optional    - Hard labels if return_labels=True.
+    C_norm : ndarray (n_samples_block, n_labels) or None   - Normalized cluster counts (only if return_membership).
+    labels : ndarray (n_samples_block,)                    - Hard labels.
     """
     X_block = np.atleast_2d(X_block)
-    n_obs = len(ol)
-    knn_eff = min(knn, n_obs)
+    knn_eff = min(knn, len(ol))
+    n_labels = int(ol.max()) + 1
+    onehot = np.eye(n_labels, dtype=np.float32)[ol]
+    n = X_block.shape[0]
 
-    if method == "brute":
-        dist, closest = safe_knn(X_block, O, knn_eff)
-    elif method == "faiss":
-        _, closest = index.search(X_block.astype(np.float32), knn_eff)
-    else:  # pynndescent
-        closest, _ = index.query(X_block, k=knn_eff)
+    labels = np.empty(n, dtype=np.int64)
+    C_norm = np.empty((n, n_labels), dtype=np.float32) if return_membership else None
 
-    lknn = ol[closest] 
+    for i, closest in _neighbor_batches(X_block, O, knn_eff, method, index):
+        counts = np.zeros((closest.shape[0], n_labels), dtype=np.float32)
+        for j in range(knn_eff):
+            counts += onehot[closest[:, j]]
+        labels[i:i + closest.shape[0]] = np.argmax(counts, axis=1)
+        if return_membership:
+            C_norm[i:i + closest.shape[0]] = counts / knn_eff
 
-    C = np.zeros((X_block.shape[0], n_clusters), dtype=np.float32)
-    for j in range(n_clusters):
-        C[:, j] = np.sum(lknn == j, axis=1)
-        
-    C_norm = C / knn_eff
-
-    if return_labels:
-        labels = np.argmax(C, axis=1)
-        return C_norm, labels
-
-    return C_norm
+    return C_norm, labels
 
 def _score_block(X_block, O, x, method="brute", index=None):
     """
@@ -192,8 +202,9 @@ def _score_block(X_block, O, x, method="brute", index=None):
     x = min(x, O.shape[0])
     X_block = np.atleast_2d(X_block)
     if method == "brute":
-        dist, _ = safe_knn(X_block, O, x)
-        scores = np.median(dist, axis=1)
+        scores = np.empty(X_block.shape[0])
+        for i, dist, _ in _knn_batches(X_block, O, x):
+            scores[i:i + dist.shape[0]] = np.median(dist, axis=1)
     elif method == "faiss":
         dist, _ = index.search(X_block.astype(np.float32), x)
         scores = np.median(dist, axis=1)
@@ -222,12 +233,47 @@ def _observer_count_block(X_block, O, x, method="brute", index=None):
     X_block = np.atleast_2d(X_block)
     k = O.shape[0]
     if method == "brute":
-        _, closest = safe_knn(X_block, O, x)
+        P = np.zeros(k, dtype=np.int64)
+        for _, _, idx in _knn_batches(X_block, O, x):
+            P += np.bincount(idx.ravel(), minlength=k)
+        return P
     elif method == "faiss":
         _, closest = index.search(X_block.astype(np.float32), x)
     else:
         closest, _ = index.query(X_block, k=x)
     return np.bincount(closest.ravel(), minlength=k)
+
+
+def _renew_observers(O, ol, X, kmp, keep_old, x, chunksize, n_jobs, method, build_index, rseed):
+    """
+    Add new observers sampled from X and drop the least-used OLD observers.
+    At most (1 - keep_old) of the old model is replaced; new observers are never dropped in this round.
+    Returns (observers, labels) where labels are -1 for the new observers.
+    """
+    m = X.shape[0]
+    k_old = O.shape[0]
+    k_new = min(max(1, int(m * kmp)), max(1, int(k_old * (1 - keep_old))))
+
+    O_new = random_sample(X, k_new, rseed)
+    k_new = O_new.shape[0]
+    O_ext = np.vstack((O, O_new))
+    old_l = np.concatenate([ol, -np.ones(k_new, dtype=int)])
+    index = build_index(O_ext)
+
+    blocks = [X[i:i+chunksize] for i in range(0, m, chunksize)]
+    if n_jobs is None or n_jobs == 1:
+        P = np.sum([_observer_count_block(b, O_ext, x, method, index) for b in blocks], axis=0)
+    else:
+        counts = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_observer_count_block)(b, O_ext, x, method, index) for b in blocks )
+        P = np.sum(counts, axis=0)
+
+    P = P.astype(float)
+    P[k_old:] = np.inf
+    toremove = np.argsort(P, kind="stable")[:k_new]
+    keep = np.ones(len(O_ext), dtype=bool)
+    keep[toremove] = False
+    return O_ext[keep], old_l[keep]
 
 
 class SDO:
@@ -327,6 +373,8 @@ class SDO_numpy:
 
         self.O = None
         self.index = None
+        self.k_ = None
+        self.sigma2_ = None
 
         self._faiss = None
         self._pynndescent = None
@@ -344,11 +392,10 @@ class SDO_numpy:
 
         # model size estimation
         m = X.shape[0]
-        if self.k is None:
-            sigma = estimate_sigma_pca( X,  max_samples=self.max_samples_pca,  random_state=self.rseed )
-            error = 0.05
-            self.k = sample_size(m, sigma, error)
         k = self.k
+        if k is None:
+            k, self.sigma2_ = estimate_k(X, self.max_samples_pca, self.rseed)
+        self.k_ = k
 
         # observers
         O0 = random_sample(X, k, self.rseed)
@@ -435,6 +482,8 @@ class SDO_dask:
         self.n_jobs = n_jobs
 
         self.O = None  # observers
+        self.k_ = None
+        self.sigma2_ = None
         self._client = None  # removed: no client needed here
 
     def _as_dask_array(self, X):
@@ -461,12 +510,12 @@ class SDO_dask:
         m = X.shape[0]
 
         # automatic k if not provided
-        if self.k is None:
-            sigma = estimate_sigma_pca(X, max_samples=self.max_samples_pca, random_state=self.rseed)
-            error = 0.1 * sigma
-            self.k = sample_size(m, sigma, error)
+        k = self.k
+        if k is None:
+            k, self.sigma2_ = estimate_k(X, self.max_samples_pca, self.rseed)
+        self.k_ = k
 
-        O0 = random_sample(X, self.k, self.rseed)
+        O0 = random_sample(X, k, self.rseed)
 
         # compute observer counts in blocks
         blocks = [X[i:i+self.chunksize] for i in range(0, m, self.chunksize)]
@@ -574,37 +623,37 @@ class SDOclust:
         """
         return self._impl.fit_predict(X, return_membership=return_membership, xc=xc)
 
-    def update(self, X, cons_factor=0.1):
+    def update(self, X, keep_old=0.6):
         """
         Update the model with new data.
         Param.:      X : array-like, shape (n_samples, n_features)   - New input data.
-                     cons_factor : float, optional                   - Fraction of previous observers to retain.
+                     keep_old : float, optional  - Minimum fraction of previous observers kept (default 0.6).
         Returns:     self : SDOclust instance
         """
-        self._impl.update(X, cons_factor=cons_factor)
+        self._impl.update(X, keep_old=keep_old)
         return self
 
-    def update_from_dask(self, X, cons_factor=0.1, n_sample=None):
+    def update_from_dask(self, X, keep_old=0.6, n_sample=None):
         """
         Update the model from a Dask dataset.
         Param.:      X : dask array/dataframe           - New input data.
-                     cons_factor : float, optional      - Fraction of previous observers to retain.
+                     keep_old : float, optional  - Minimum fraction of previous observers kept (default 0.6).
                      n_sample : int, optional           - Number of samples to use.
         Returns:     self : SDOclust instance
         """
-        return self._impl.update_from_dask(X, cons_factor=cons_factor, n_sample=n_sample)
+        return self._impl.update_from_dask(X, keep_old=keep_old, n_sample=n_sample)
 
-    def update_predict(self, X, return_membership=False, xc=None, cons_factor=0.1):
+    def update_predict(self, X, return_membership=False, xc=None, keep_old=0.6):
         """
         Update the model and predict cluster labels.
         Param.:      X : array-like, shape (n_samples, n_features)   - New input data.
                      return_membership : bool, optional              - If True, also return membership degrees.
                      xc : int, optional                              - Number of observers to use for extending labels.
-                     cons_factor : float, optional                   - Fraction of previous observers to retain.
+                     keep_old : float, optional  - Minimum fraction of previous observers kept (default 0.6).
         Returns:     labels : ndarray, shape (n_samples,)            - Cluster labels for each sample, or
                     (membership, labels) : tuple of ndarrays         - If return_membership=True.
         """
-        return self._impl.update_predict(X, return_membership=return_membership, xc=xc, cons_factor=cons_factor)
+        return self._impl.update_predict(X, return_membership=return_membership, xc=xc, keep_old=keep_old)
 
     def outlierness(self, X, x=None):
         """
@@ -663,12 +712,15 @@ class SDOclust_numpy:
         self.index = None
         self.kmp = None
         self.n_clusters = None
+        self.k_ = None
+        self.sigma2_ = None
 
     def fit(self, X):
         X = check_array(X, accept_sparse="csr")
 
-        self.sdo = SDO_numpy( x=self.x, qv=self.qv, chunksize=self.chunksize, method=self.method,  max_samples_pca=self.max_samples_pca, k=self.k,            rseed=self.rseed, n_jobs=self.n_jobs).fit(X)
+        self.sdo = SDO_numpy( x=self.x, qv=self.qv, chunksize=self.chunksize, method=self.method,  max_samples_pca=self.max_samples_pca, k=self.k, rseed=self.rseed, n_jobs=self.n_jobs).fit(X)
 
+        self.k_, self.sigma2_ = self.sdo.k_, self.sdo.sigma2_
         self.O = self.sdo.O
         self.ol = ConnectedComponentsClustering(zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop, n_jobs=self.n_jobs).fit(self.O).labels_
         self._remove_small_clusters()
@@ -683,65 +735,37 @@ class SDOclust_numpy:
         xc = xc if xc is not None else self.xc
 
         blocks = [X[i:i+self.chunksize] for i in range(0, X.shape[0], self.chunksize)]
+        args = (self.O, self.ol, xc, self.method, self.index, return_membership)
         if self.n_jobs is None or self.n_jobs == 1:
-            results = [_extend_labels_block(b, self.O, self.ol, xc, self.n_clusters, self.method, self.index, True) for b in blocks]
+            results = [_extend_labels_block(b, *args) for b in blocks]
         else:
             results = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-                delayed(_extend_labels_block)(b, self.O, self.ol, xc, self.n_clusters, self.method, self.index, True) for b in blocks )
+                delayed(_extend_labels_block)(b, *args) for b in blocks )
 
-        membership = np.vstack([r[0] for r in results])
         labels = np.concatenate([r[1] for r in results])
-
-        return (membership, labels) if return_membership else labels
+        if return_membership:
+            return np.vstack([r[0] for r in results]), labels
+        return labels
 
     def fit_predict(self, X, return_membership=False, xc=None):
         self.fit(X)
         return self.predict(X, return_membership=return_membership, xc=xc)
 
-    def update(self, X, cons_factor=0.1):
+    def update(self, X, keep_old=0.6):
         X = check_array(X, accept_sparse="csr")
 
-        m = X.shape[0]
-        k_old = self.O.shape[0]
-        k_new = max(1, int(m * self.kmp))
-        k_tot = k_old + k_new
+        self.O, old_l = _renew_observers(self.O, self.ol, X, self.kmp, keep_old, self.x, self.chunksize,
+                                         self.n_jobs, self.method, self._build_index_for, self.rseed)
 
-        O_new = random_sample(X, k_new, self.rseed)
-        O_ext = np.vstack((self.O, O_new))
-
-        index = self._build_index_for(O_ext)
-
-        blocks = [X[i:i+self.chunksize] for i in range(0, m, self.chunksize)]
-        if self.n_jobs is None or self.n_jobs == 1:
-            P = np.sum([_observer_count_block(b, O_ext, self.xc, self.method, index) for b in blocks], axis=0)
-        else:
-            counts = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-                delayed(_observer_count_block)(b, O_ext, self.xc, self.method, index) for b in blocks )
-            P = np.sum(counts, axis=0)
-
-        n_cons = int(len(self.O) * cons_factor)
-        keep_cons_idx = np.random.choice(len(self.O), size=n_cons, replace=False)
-        mask_candidates = np.ones(len(O_ext), dtype=bool)
-        mask_candidates[keep_cons_idx] = False
-        toremove = np.argsort(P[mask_candidates])[:k_new]
-        candidates_idx = np.where(mask_candidates)[0]
-        toremove = candidates_idx[toremove]
-        keep = np.ones(len(O_ext), dtype=bool)
-        keep[toremove] = False
-        self.O = O_ext[keep]
-
-        self.ol = ConnectedComponentsClustering(zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop, n_jobs=self.n_jobs).fit(self.O).labels_
-
-        self._relabel_clusters()
-        self._build_index()
-
-        self.kmp = self.O.shape[0] / m
+        new_l = ConnectedComponentsClustering(zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop, n_jobs=self.n_jobs).fit(self.O).labels_
+        self.ol = harmonize_labels(old_l, np.asarray(new_l))
         self.n_clusters = len(np.unique(self.ol))
-
+        self._build_index()
+        self.sdo.O, self.sdo.index = self.O, self.index
         return self
 
-    def update_predict(self, X, return_membership=False, xc=None, cons_factor=0.1):
-        self.update(X, cons_factor=cons_factor)
+    def update_predict(self, X, return_membership=False, xc=None, keep_old=0.6):
+        self.update(X, keep_old=keep_old)
         return self.predict(X, return_membership=return_membership, xc=xc)
 
     def outlierness(self, X, x=None):
@@ -837,6 +861,9 @@ class SDOclust_dask:
         self.O = None
         self.ol = None
         self.n_clusters = None
+        self.kmp = None
+        self.k_ = None
+        self.sigma2_ = None
 
     def _as_dask_array(self, X):
         """
@@ -854,68 +881,44 @@ class SDOclust_dask:
         Xs = random_sample(X, n_sample, self.rseed)
         return self.fit(Xs)
 
-    def update_from_dask(self, X, n_sample=None, cons_factor=0.1):
+    def update_from_dask(self, X, n_sample=None, keep_old=0.6):
         if n_sample is None:
             n_sample = self.chunksize
         Xs = random_sample(X, n_sample, self.rseed)
-        return self.update(Xs, cons_factor=cons_factor)
+        return self.update(Xs, keep_old=keep_old)
 
     def fit(self, X):
         X = check_array(X, accept_sparse="csr")
 
         self.sdo = SDO_dask(
             x=self.x, qv=self.qv, chunksize=self.chunksize, k=self.k,
-            rseed=self.rseed, max_samples_pca=self.max_samples_pca, n_jobs=self.n_jobs
-        ).fit(X)
+            rseed=self.rseed, max_samples_pca=self.max_samples_pca, n_jobs=self.n_jobs).fit(X)
 
+        self.k_, self.sigma2_ = self.sdo.k_, self.sdo.sigma2_
         self.O = self.sdo.O
 
         self.ol = ConnectedComponentsClustering(
             zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop,
-            n_jobs=self.n_jobs
-        ).fit(self.O).labels_
+            n_jobs=self.n_jobs).fit(self.O).labels_
 
         self._remove_small_clusters()
         self._relabel_clusters()
         self.n_clusters = len(np.unique(self.ol))
+        self.kmp = self.O.shape[0] / X.shape[0]
 
         return self
 
-    def update(self, X, cons_factor=0.1):
+    def update(self, X, keep_old=0.6):
         X = check_array(X, accept_sparse="csr")
-        m = X.shape[0]
 
-        k_new = max(1, int(m * (self.O.shape[0] / m)))
-        O_new = random_sample(X, k_new, self.rseed)
+        self.O, old_l = _renew_observers(self.O, self.ol, X, self.kmp, keep_old, self.x, self.chunksize,
+                                         self.n_jobs, "brute", lambda O: None, self.rseed)
 
-        O_ext = np.vstack((self.O, O_new))
-
-        blocks = [X[i:i+self.chunksize] for i in range(0, m, self.chunksize)]
-        if self.n_jobs is None or self.n_jobs == 1:
-            P = np.sum([_observer_count_block(b, O_ext, self.xc, "brute", None) for b in blocks], axis=0)
-        else:
-            counts = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-                delayed(_observer_count_block)(b, O_ext, self.xc, "brute", None) for b in blocks )
-            P = np.sum(counts, axis=0)
-
-        n_cons = int(len(self.O) * cons_factor)
-        keep_cons_idx = np.random.choice(len(self.O), size=n_cons, replace=False)
-        mask_candidates = np.ones(len(O_ext), dtype=bool)
-        mask_candidates[keep_cons_idx] = False
-        toremove = np.argsort(P[mask_candidates])[:k_new]
-        candidates_idx = np.where(mask_candidates)[0]
-        toremove = candidates_idx[toremove]
-        keep = np.ones(len(O_ext), dtype=bool)
-        keep[toremove] = False
-        self.O = O_ext[keep]
-
-        self.ol = ConnectedComponentsClustering( zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop,
+        new_l = ConnectedComponentsClustering( zeta=self.zeta, chi=self.chi, chi_min=self.chi_min, chi_prop=self.chi_prop,
             n_jobs=self.n_jobs).fit(self.O).labels_
-
-        self._relabel_clusters()
+        self.ol = harmonize_labels(old_l, np.asarray(new_l))
         self.n_clusters = len(np.unique(self.ol))
         self.sdo.O = self.O
-        self.kmp = self.O.shape[0] / m
 
         return self
 
@@ -923,23 +926,21 @@ class SDOclust_dask:
     def predict(self, X, return_membership=False, xc=None):
         xc = xc if xc is not None else self.xc
         Xd = self._as_dask_array(X)
-        n_clusters = self.n_clusters
+        n_labels = int(self.ol.max()) + 1
 
         # map function for blocks
-        def _map_labels(block, O, ol, knn, n_clusters):
-            return _extend_labels_block(block, O, ol, knn=knn, n_clusters=n_clusters, method="brute")
+        def _map_labels(block, O, ol, knn):
+            return _extend_labels_block(block, O, ol, knn, "brute", None, False)[1]
 
-        Md = Xd.map_blocks(
-            _map_labels, O=self.O, ol=self.ol, knn=xc, n_clusters=n_clusters,
-            dtype=float, chunks=(Xd.chunks[0], n_clusters)
-        )
-
-        labels = self._da.argmax(Md, axis=1)
+        def _map_membership(block, O, ol, knn):
+            return _extend_labels_block(block, O, ol, knn, "brute", None, True)[0]
 
         if return_membership:
-            return Md, labels
-        else:
-            return labels
+            Md = Xd.map_blocks(_map_membership, O=self.O, ol=self.ol, knn=xc,
+                               dtype=np.float32, chunks=(Xd.chunks[0], (n_labels,)))
+            return Md, self._da.argmax(Md, axis=1)
+
+        return Xd.map_blocks(_map_labels, O=self.O, ol=self.ol, knn=xc, dtype=np.int64, drop_axis=1)
 
     def fit_predict(self, X, return_membership=False, xc=None):
         if isinstance(X, self._da.Array):
@@ -948,8 +949,8 @@ class SDOclust_dask:
             self.fit(X)
         return self.predict(X, return_membership=return_membership, xc=xc)
 
-    def update_predict(self, X, return_membership=False, xc=None, cons_factor=0.1):
-        self.update_from_dask(X, cons_factor=cons_factor)
+    def update_predict(self, X, return_membership=False, xc=None, keep_old=0.6):
+        self.update_from_dask(X, keep_old=keep_old)
         return self.predict(X, return_membership=return_membership, xc=xc)
 
     def outlierness(self, X, x=None):
