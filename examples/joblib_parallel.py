@@ -9,7 +9,7 @@ from sklearn.metrics import adjusted_rand_score
 from sdoclust_parallel import SDOclust
 import numpy as np
 
-X, y_true = make_blobs(n_samples=200000, centers=6, cluster_std=0.5, random_state=0)
+X, y_true = make_blobs(n_samples=200000, centers=6, cluster_std=0.5, random_state=10)
 print(f"Dataset: {X.shape[0]} samples, {X.shape[1]} dimensions, {len(np.unique(y_true))} clusters")
 
 for n_jobs in (1, -1):

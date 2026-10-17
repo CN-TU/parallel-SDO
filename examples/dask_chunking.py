@@ -8,12 +8,12 @@ from sklearn.datasets import make_blobs
 from sklearn.metrics import adjusted_rand_score
 from sdoclust_parallel import SDOclust
 
-X, y_true = make_blobs(n_samples=200000, centers=6, cluster_std=0.5, random_state=0)
+X, y_true = make_blobs(n_samples=200000, centers=6, cluster_std=0.5, random_state=10)
 print(f"Dataset: {X.shape[0]} samples, {X.shape[1]} dimensions, {len(np.unique(y_true))} clusters")
 Xd = da.from_array(X, chunks=(5000, X.shape[1]))  # small chunks -> many partitions
 print(f"{Xd.npartitions} chunks of {Xd.chunks[0][0]} rows each never fully materialized until .compute())")
 
-model = SDOclust(backend="dask", zeta=0.6, chunksize=5_000, rseed=0)
+model = SDOclust(backend="dask", zeta=0.7, chunksize=5000, rseed=0)
 model.fit_from_dask(Xd, n_sample=20000)   # fit on a small sample only
 labels = model.predict(Xd)                # still lazy: a dask graph
 print(f"predict() returns a lazy graph: {type(labels).__module__}.{type(labels).__name__}")
