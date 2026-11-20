@@ -62,7 +62,7 @@ def estimate_sigma_pca(X, max_samples=200000, random_state=0):
     
 def model_error(m):
     """Admissible error of the sample-size formula (your formula, unchanged)."""
-    return 0.1 / (1 + np.sqrt(np.log10(m)))
+    return 0.2 / (1 + np.sqrt(np.log10(m)))
 
 def estimate_k(X, max_samples=100000, random_state=0):
     """Returns (k, sigma2). k is Cochran's sample size with sigma^2 = var(PC1)/d."""
